@@ -1,0 +1,17 @@
+{
+	"FIRST_OPTION":false,
+	"multiplierPerStrengthLevel":0.50,
+	"SECOND_OPTION":false,
+	"multiplierPerPMCLevel":0.33,
+	"THIRD_OPTION":false,
+	"multiplier":1.25,
+	"FOURTH_OPTION":false,
+	"baseOverweightLowerLimits": 21, 
+    "baseOverweightUpperLimits": 81,
+    "walkOverweightLowerLimits": 42,
+    "walkOverweightUpperLimits": 70,
+    "walkSpeedOverweightLowerLimits": 34,
+    "walkSpeedOverweightUpperLimits": 75,
+    "sprintOverweightLowerLimits": 21,
+    "sprintOverweightUpperLimits": 58
+}
