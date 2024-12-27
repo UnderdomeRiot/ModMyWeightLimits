@@ -1,181 +1,281 @@
 import { DependencyContainer } from "tsyringe";
-import { IPreSptLoadMod } from "@spt/models/external/IPreSptLoadMod";
-import { IPostDBLoadMod } from "@spt/models/external/IPostDBLoadMod";
-
+import { IPreSptLoadMod, IPostDBLoadMod } from "@spt/models/external/mod-interfaces";
 import { DatabaseServer } from "@spt/servers/DatabaseServer";
 import { LogTextColor } from "@spt/models/spt/logging/LogTextColor";
 import { ProfileHelper } from "@spt/helpers/ProfileHelper";
 import { SkillTypes } from "@spt/models/enums/SkillTypes";
+import { ILogger } from "@spt/models/spt/utils/ILogger";
+import { StaticRouterModService } from "@spt/services/mod/staticRouter/StaticRouterModService";
 
-import type { ILogger } from "@spt/models/spt/utils/ILogger";
-import type { StaticRouterModService } from "@spt/services/mod/staticRouter/StaticRouterModService";
+// Enums para mejorar la legibilidad y mantenibilidad
+enum WeightOption {
+    STRENGTH_BASED = 'FIRST_OPTION',
+    PMC_LEVEL_BASED = 'SECOND_OPTION',
+    STATIC_MULTIPLIER = 'THIRD_OPTION',
+    CUSTOM_LIMITS = 'FOURTH_OPTION'
+}
 
-class Mod implements IPreSptLoadMod, IPostDBLoadMod 
-{
+interface WeightConfig {
+    [WeightOption.STRENGTH_BASED]: boolean;
+    [WeightOption.PMC_LEVEL_BASED]: boolean;
+    [WeightOption.STATIC_MULTIPLIER]: boolean;
+    [WeightOption.CUSTOM_LIMITS]: boolean;
+    VERBOSE_MODE: boolean;
+    multiplier: number;
+    multiplierPerStrengthLevel: number;
+    multiplierPerPMCLevel: number;
+    sprintOverweightLowerLimits: number;
+    sprintOverweightUpperLimits: number;
+    walkOverweightLowerLimits: number;
+    walkOverweightUpperLimits: number;
+    walkSpeedOverweightLowerLimits: number;
+    walkSpeedOverweightUpperLimits: number;
+    baseOverweightLowerLimits: number;
+    baseOverweightUpperLimits: number;
+}
 
-    private readonly modName = "ModMyWeight";
+interface StaminaLimits {
+    x: number;
+    y: number;
+}
 
+interface ModState {
+    execute: boolean;
+    alreadyApplied: boolean;
+    pmcLevel: number;
+    strengthLevel: number;
+    previousPmcLevel: number;
+    previousStrengthLevel: number;
+    previousStamina: Record<string, StaminaLimits> | null;
+}
+
+class WeightMod implements IPreSptLoadMod, IPostDBLoadMod {
+    private static readonly MOD_NAME = "ModMyWeightLimits";
+    private static readonly WEIGHT_LIMITS = [
+        ["SprintOverweightLimits", "sprintOverweightLowerLimits", "sprintOverweightUpperLimits"],
+        ["WalkOverweightLimits", "walkOverweightLowerLimits", "walkOverweightUpperLimits"],
+        ["WalkSpeedOverweightLimits", "walkSpeedOverweightLowerLimits", "walkSpeedOverweightUpperLimits"],
+        ["BaseOverweightLimits", "baseOverweightLowerLimits", "baseOverweightUpperLimits"]
+    ] as const;
+
+    private readonly config: WeightConfig;
+    private readonly state: ModState;
     private container: DependencyContainer;
-    private config = require("../config/config.json");
     private logger: ILogger;
-
-    private pmcLevel: number = 0;
-    private strengthLevel: number = 0;
     private tables: any;
-    private stamina: any;
-    private execute: boolean = false;
+    private stamina: Record<string, StaminaLimits>;
 
-    public preSptLoad(container: DependencyContainer): void 
-    {
-        this.container = container;
-        const staticRouterModService = container.resolve<StaticRouterModService>("StaticRouterModService");
-
-        staticRouterModService.registerStaticRouter(
-            "ModMyWeight_/client/game/start",
-            [
-                {
-                    url: "/client/game/start",
-                    action: this.handleGameStart.bind(this)
-                }
-            ],
-            this.modName
-        );
+    constructor() {
+        this.config = require("../config/config.json");
+        this.state = {
+            execute: false,
+            alreadyApplied: false,
+            pmcLevel: 0,
+            strengthLevel: 0,
+            previousPmcLevel: 0,
+            previousStrengthLevel: 0,
+            previousStamina: null
+        };
     }
 
-    public postDBLoad(container: DependencyContainer): void 
-    {
+    private verboseLog(message: string, color: LogTextColor = LogTextColor.WHITE): void {
+        if (this.config.VERBOSE_MODE) {
+            this.logger.log(`[${WeightMod.MOD_NAME}] : ${message}`, color);
+        }
+    }
+
+    private systemLog(message: string, color: LogTextColor = LogTextColor.WHITE): void {
+        this.logger.log(`[${WeightMod.MOD_NAME}] : ${message}`, color);
+    }
+
+    public preSptLoad(container: DependencyContainer): void {
         this.container = container;
-        this.logger = container.resolve<ILogger>("WinstonLogger");
-        this.logger.log(`[${this.modName}] : Mod loading`, LogTextColor.WHITE);
+        this.registerRouter();
+    }
 
-        this.tables = container.resolve<DatabaseServer>("DatabaseServer").getTables();
-        this.stamina = this.tables.globals.config.Stamina;
-
+    public postDBLoad(container: DependencyContainer): void {
+        this.initializeServices(container);
         this.initializeConfig();
     }
 
-    private handleGameStart(url: string, info: any, sessionId: string, output: any): any 
-    {
-        const profileHelper = this.container.resolve<ProfileHelper>("ProfileHelper");
-        const profile = profileHelper.getPmcProfile(sessionId);
+    private registerRouter(): void {
+        const staticRouterModService = this.container.resolve<StaticRouterModService>("StaticRouterModService");
+        staticRouterModService.registerStaticRouter(
+            `${WeightMod.MOD_NAME}_/client/game/start`,
+            [{
+                url: "/client/game/start",
+                action: (_url: string, _info: any, sessionId: string, output: any) => 
+                    this.handleGameStart(sessionId, output)
+            }],
+            WeightMod.MOD_NAME
+        );
+    }
 
-        this.pmcLevel = profile.Info.Level;
-        this.strengthLevel = profileHelper.getSkillFromProfile(profile, SkillTypes.STRENGTH)?.Progress || 0;
+    private initializeServices(container: DependencyContainer): void {
+        this.container = container;
+        this.logger = container.resolve<ILogger>("WinstonLogger");
+        this.systemLog("Mod loading", LogTextColor.WHITE);
 
-        if (this.execute) 
-        {
-            this.applyWeightModifications();
-        }
+        const dbServer = container.resolve<DatabaseServer>("DatabaseServer");
+        this.tables = dbServer.getTables();
+        this.stamina = this.tables.globals.config.Stamina;
+        this.state.previousStamina = { ...this.stamina };
+    }
+
+    private handleGameStart(sessionId: string, output: any): any {
+        if (!this.state.execute) return output;
+
+        const profile = this.container.resolve<ProfileHelper>("ProfileHelper")
+            .getPmcProfile(sessionId);
+
+        this.updateLevels(profile);
+        this.checkLevelChanges();
+        this.applyWeightModifications();
 
         return output;
     }
 
-    private initializeConfig(): void 
-    {
-        const activeOptions = [
-            this.config.FIRST_OPTION,
-            this.config.SECOND_OPTION,
-            this.config.THIRD_OPTION,
-            this.config.FOURTH_OPTION
-        ].filter(Boolean);
+    private updateLevels(profile: any): void {
+        const profileHelper = this.container.resolve<ProfileHelper>("ProfileHelper");
+        this.state.pmcLevel = profile.Info.Level;
+        this.state.strengthLevel = Math.floor(
+            (profileHelper.getSkillFromProfile(profile, SkillTypes.STRENGTH)?.Progress || 0) / 100
+        );
+    }
 
-        if (activeOptions.length !== 1) 
-        {
-            const errorMessage =
-                activeOptions.length === 0
-                    ? "At least one option"
-                    : "Only one option";
-            this.logger.log(`[${this.modName}] : ${errorMessage} of [${this.modName}] must be true, mod deactivated`, LogTextColor.RED);
-            return;
-        }
+    private checkLevelChanges(): void {
+        const strengthLevelIncreased = this.state.strengthLevel > this.state.previousStrengthLevel;
+        const pmcLevelIncreased = this.state.pmcLevel > this.state.previousPmcLevel;
 
-        this.execute = true;
-
-        if (this.config.FIRST_OPTION) 
-        {
-            this.logger.log(`[${this.modName}] : Applying [option 1] waiting game to start...`, LogTextColor.GREEN);
-        }
-        else if (this.config.SECOND_OPTION) 
-        {
-            this.logger.log(`[${this.modName}] : Applying [option 2] waiting game to start...`, LogTextColor.GREEN);
-        }
-        else if (this.config.THIRD_OPTION) 
-        {
-            this.applyFixedMultiplier(this.config.multiplier);
-            this.logger.log(`[${this.modName}] : Applied [option 3] default static multiplier ${this.config.multiplier}x`, LogTextColor.GREEN);
-        } 
-        else if (this.config.FOURTH_OPTION) 
-        {
-            this.applyCustomWeightLimits(this.config);
-            this.logger.log(`[${this.modName}] : Applied [option 4] custom weight limits`, LogTextColor.GREEN);
+        if (strengthLevelIncreased && this.config[WeightOption.STRENGTH_BASED]) {
+            this.state.previousStrengthLevel = this.state.strengthLevel;
+            this.state.alreadyApplied = false;
+        } else if (pmcLevelIncreased && this.config[WeightOption.PMC_LEVEL_BASED]) {
+            this.state.previousPmcLevel = this.state.pmcLevel;
+            this.state.alreadyApplied = false;
         }
     }
 
-    private applyWeightModifications(): void 
-    {
-        if (this.config.FIRST_OPTION) 
-        {
+    private initializeConfig(): void {
+        const activeOptions = Object.values(WeightOption)
+            .filter(option => this.config[option])
+            .length;
+
+        if (activeOptions !== 1) {
+            this.systemLog(
+                `${activeOptions === 0 ? 'At least' : 'Only'} one option must be true, mod deactivated`,
+                LogTextColor.RED
+            );
+            return;
+        }
+
+        this.applySelectedOption();
+    }
+
+    private calculateMultiplier(level: number, multiplierPerLevel: number): number {
+        const baseMultiplier = 1;
+        const percentage = level / 100;
+        const bonus = percentage * multiplierPerLevel;
+        return baseMultiplier + bonus;
+    }
+
+    private logMultiplierCalculation(label: string, level: number, multiplierPerLevel: number, finalMultiplier: number): void {
+        this.verboseLog(`Calculating ${label}-based multiplier:`, LogTextColor.GREEN);
+        this.verboseLog(`→ Current ${label} level: ${level}`, LogTextColor.WHITE);
+        this.verboseLog(`→ ${label} as percentage: ${(level / 100).toFixed(2)} (${level}/100)`, LogTextColor.WHITE);
+        this.verboseLog(`→ ${label} bonus: ${((level / 100) * multiplierPerLevel).toFixed(2)} (${(level / 100).toFixed(2)} × ${multiplierPerLevel} multiplierPer${label}Level)`, LogTextColor.WHITE);
+        this.verboseLog(`→ Final multiplier: ${finalMultiplier.toFixed(2)} (1 + ${((level / 100) * multiplierPerLevel).toFixed(2)})`, LogTextColor.WHITE);
+    }
+
+    private applySelectedOption(): void {
+        const options: Record<WeightOption, () => void> = {
+            [WeightOption.STRENGTH_BASED]: () => {
+                this.state.execute = true;
+                this.verboseLog("Applying [Strength-based / Option 1] waiting game to start...", LogTextColor.GREEN);
+            },
+            [WeightOption.PMC_LEVEL_BASED]: () => {
+                this.state.execute = true;
+                this.verboseLog("Applying [PMC Level-based / Option 2] waiting game to start...", LogTextColor.GREEN);
+            },
+            [WeightOption.STATIC_MULTIPLIER]: () => {
+                this.applyFixedMultiplier(this.config.multiplier);
+                this.verboseLog(`Applied [Static Multiplier / Option 3] default static multiplier ${this.config.multiplier}x`, LogTextColor.GREEN);
+            },
+            [WeightOption.CUSTOM_LIMITS]: () => {
+                this.applyCustomWeightLimits();
+                this.verboseLog("Applied [Custom Limits / Option 4] custom weight limits", LogTextColor.GREEN);
+            }
+        };
+
+        const selectedOption = Object.entries(options)
+            .find(([key]) => this.config[key as WeightOption]);
+
+        if (selectedOption) {
+            selectedOption[1]();
+        }
+    }
+
+    private applyWeightModifications(): void {
+        if (this.config[WeightOption.STRENGTH_BASED]) {
             this.modifyWeightBasedOnStrength();
-        } 
-        else if (this.config.SECOND_OPTION) 
-        {
+        } else if (this.config[WeightOption.PMC_LEVEL_BASED]) {
             this.modifyWeightBasedOnLevel();
         }
     }
 
-    private modifyWeightBasedOnStrength(): void 
-    {
-        if (!this.strengthLevel) 
-        {
-            this.logger.log(`[${this.modName}] : Strength level not initialized`, LogTextColor.RED);
+    private modifyWeightBasedOnStrength(): void {
+        if (!this.state.strengthLevel) {
+            this.verboseLog("Strength level not initialized", LogTextColor.RED);
             return;
         }
 
-        const multiplier = 1 + (this.strengthLevel / 10000) * this.config.multiplierPerStrengthLevel;
+        const multiplier = this.calculateMultiplier(
+            this.state.strengthLevel,
+            this.config.multiplierPerStrengthLevel
+        );
+
         this.applyFixedMultiplier(multiplier);
-        this.logger.log(`[${this.modName}] : Applied [option 1] weight modifications based on strength level, multiplier of ${multiplier}x`, LogTextColor.GREEN);
+        this.logMultiplierCalculation("Strength", this.state.strengthLevel, this.config.multiplierPerStrengthLevel, multiplier);
+        this.verboseLog(`Applied weight modifications - All weight limits multiplied by ${multiplier.toFixed(2)}x`, LogTextColor.GREEN);
     }
 
-    private modifyWeightBasedOnLevel(): void 
-    {
-        if (!this.pmcLevel) 
-        {
-            this.logger.log(`[${this.modName}] : PMC level not initialized`, LogTextColor.RED);
+    private modifyWeightBasedOnLevel(): void {
+        if (!this.state.pmcLevel) {
+            this.verboseLog("PMC level not initialized", LogTextColor.RED);
             return;
         }
 
-        const multiplier = 1 + (this.pmcLevel / 100) * this.config.multiplierPerPMCLevel;
+        const multiplier = this.calculateMultiplier(
+            this.state.pmcLevel,
+            this.config.multiplierPerPMCLevel
+        );
+
         this.applyFixedMultiplier(multiplier);
-        this.logger.log(`[${this.modName}] : Applied [option 2] weight modifications based on PMC level, multiplier of ${multiplier}x`, LogTextColor.GREEN);
+        this.logMultiplierCalculation("PMC", this.state.pmcLevel, this.config.multiplierPerPMCLevel, multiplier);
+        this.verboseLog(`Applied weight modifications - All weight limits multiplied by ${multiplier.toFixed(2)}x`, LogTextColor.GREEN);
     }
 
-    private applyFixedMultiplier(multiplier: number): void 
-    {
-        [
-            "SprintOverweightLimits",
-            "WalkOverweightLimits",
-            "WalkSpeedOverweightLimits",
-            "BaseOverweightLimits"
-        ].forEach((limit) => 
-        {
-            this.stamina[limit].x *= multiplier;
-            this.stamina[limit].y *= multiplier;
+    private applyFixedMultiplier(multiplier: number): void {
+        if (this.state.alreadyApplied) return;
+
+        WeightMod.WEIGHT_LIMITS.forEach(([limit]) => {
+            if (this.state.previousStamina?.[limit]) {
+                this.stamina[limit].x = this.state.previousStamina[limit].x * multiplier;
+                this.stamina[limit].y = this.state.previousStamina[limit].y * multiplier;
+            }
         });
+
+        this.state.alreadyApplied = true;
     }
 
-    private applyCustomWeightLimits(limits: any): void 
-    {
-        [
-            ["SprintOverweightLimits", "sprintOverweightLowerLimits", "sprintOverweightUpperLimits"],
-            ["WalkOverweightLimits", "walkOverweightLowerLimits", "walkOverweightUpperLimits"],
-            ["WalkSpeedOverweightLimits", "walkSpeedOverweightLowerLimits", "walkSpeedOverweightUpperLimits"],
-            ["BaseOverweightLimits", "baseOverweightLowerLimits", "baseOverweightUpperLimits"]
-        ].forEach(([key, lower, upper]) => 
-        {
-            this.stamina[key].x = limits[lower];
-            this.stamina[key].y = limits[upper];
+    private applyCustomWeightLimits(): void {
+        WeightMod.WEIGHT_LIMITS.forEach(([key, lower, upper]) => {
+            if (this.stamina[key]) {
+                this.stamina[key].x = this.config[lower as keyof WeightConfig] as number;
+                this.stamina[key].y = this.config[upper as keyof WeightConfig] as number;
+            }
         });
     }
 }
 
-module.exports = { mod: new Mod() };
+module.exports = { mod: new WeightMod() };

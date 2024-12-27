@@ -1,9 +1,10 @@
 {
+	"VERBOSE_MODE":false,
 	"FIRST_OPTION":false,
 	"multiplierPerStrengthLevel":0.50,
 	"SECOND_OPTION":false,
 	"multiplierPerPMCLevel":0.33,
-	"THIRD_OPTION":false,
+	"THIRD_OPTION":true,
 	"multiplier":1.25,
 	"FOURTH_OPTION":false,
 	"baseOverweightLowerLimits": 21, 
