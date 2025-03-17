@@ -1,10 +1,10 @@
 {
     "name": "ModMyWeightLimits",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "main": "src/mod.js",
     "license": "CC BY-NC-ND 4.0",
     "author": "underdomeriot",
-    "sptVersion": "~3.10",
+    "sptVersion": "~3.11",
     "isBundleMod": false,
     "scripts": {
         "setup": "npm i",
